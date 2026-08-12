@@ -1,0 +1,7 @@
+outputs/
+data/sft_splits/
+
+__pycache__/
+*.pyc
+
+.vscode/

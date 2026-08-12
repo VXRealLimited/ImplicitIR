@@ -1,0 +1,7 @@
+# Needs a CUDA GPU.
+torch
+transformers==5.12.0
+datasets
+peft
+trl
+bitsandbytes  # only needed for --use-4bit
