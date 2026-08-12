@@ -61,3 +61,7 @@ Add an entry to `MODEL_REGISTRY` in `model_registry.py`: the HF model id, LoRA t
 ## Handing off to eval
 
 [ImplicitIR-Benchmark](https://github.com/VXRealLimited/ImplicitIR-Benchmark) serves and scores checkpoints produced here. The two repos are independent, so copy or symlink the relevant `outputs/<run-name>/merged/` directory to wherever `ImplicitIR-Benchmark`'s `docker-compose.yml` expects it, or edit that file's volume paths to point at this checkpoint directly.
+
+## License
+
+CC BY 4.0 — see [LICENSE](LICENSE).
