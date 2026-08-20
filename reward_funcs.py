@@ -14,8 +14,26 @@ from common.text_extract import completion_text, extract_answer, extract_thinkin
 _RAW_TAG_RE = re.compile(r"<raw>(.*?)</raw>", re.DOTALL)
 _NUMBER_RE = re.compile(r"\d{2,}")
 _QUOTE_RE = re.compile(r'["\']([^"\']{2,40})["\']')
-_EQUATION_RE = re.compile(r'(-?\d[\d,]*\.?\d*)\s*([+\-])\s*(-?\d[\d,]*\.?\d*)\s*=\s*(-?\d[\d,]*\.?\d*)')
+_NUM = r'-?\d[\d,]*\.?\d*'
+_OP = r'[+\-*/×÷]'
+_HS = r'[^\S\n]*'
+_EQUATION_RE = re.compile(
+    r'(%s(?:%s%s%s%s)+)%s=%s(%s)' % (_NUM, _HS, _OP, _HS, _NUM, _HS, _HS, _NUM)
+)
+_TERM_RE = re.compile(r'(%s)?%s(%s)' % (_OP, _HS, _NUM))
 _MONEY_RE = re.compile(r'-?\d[\d,]*\.\d+')
+
+# Multiplication and division may be written with ASCII or typographic symbols,
+# so both spellings map to the same evaluator. Division by zero yields None,
+# which _equation_holds() treats as a step that does not hold.
+_OPS = {
+    "+": lambda a, b: a + b,
+    "-": lambda a, b: a - b,
+    "*": lambda a, b: a * b,
+    "×": lambda a, b: a * b,
+    "/": lambda a, b: a / b if b != 0 else None,
+    "÷": lambda a, b: a / b if b != 0 else None,
+}
 
 
 def _extract_facts(text: str) -> set[str]:
@@ -32,22 +50,77 @@ def _to_float(token: str) -> float:
     return float(token.replace(",", ""))
 
 
-def _extract_equations(text: str) -> list[tuple[float, str, float, float]]:
-    """All "A + B = C" / "A - B = C" style arithmetic steps shown in the text,
-    e.g. the "25.00 + 50.00 = 75.00, then 75.00 + 50.00 = 125.00" running-total
-    chains seen in the training data's own derivation_reasoning examples."""
+def _extract_equations(text: str) -> list[tuple[str, float]]:
+    """All arithmetic lines "A op B (op C ...) = R" shown in the text, returned as
+    (expression, stated_result) pairs. Operators are + - * / (typographic x and
+    division-sign spellings included). Whole expressions are captured, so a correct
+    multi-term line like "12 + 12 + 13 = 37" is evaluated as written rather than
+    being mistaken for the trailing pair "12 + 13 = 37"."""
     equations = []
-    for a, op, b, c in _EQUATION_RE.findall(text):
+    for expr, rhs in _EQUATION_RE.findall(text):
         try:
-            equations.append((_to_float(a), op, _to_float(b), _to_float(c)))
+            equations.append((expr, _to_float(rhs)))
         except ValueError:
             continue
     return equations
 
 
-def _equation_holds(a: float, op: str, b: float, c: float, tol: float = 0.01) -> bool:
-    expected = a + b if op == "+" else a - b
-    return abs(expected - c) <= tol
+def _eval_expression(expr: str):
+    """Left-to-right value of an additive/multiplicative chain, or None if it cannot
+    be evaluated (e.g. a division by zero)."""
+    total = None
+    for op, num in _TERM_RE.findall(expr):
+        try:
+            value = _to_float(num)
+        except ValueError:
+            return None
+        if total is None:
+            total = value
+            continue
+        fn = _OPS.get(op or "+")
+        if fn is None:
+            return None
+        total = fn(total, value)
+        if total is None:
+            return None
+    return total
+
+
+def _equation_holds(expr: str, stated: float, tol: float = 0.01) -> bool:
+    actual = _eval_expression(expr)
+    if actual is None:
+        return False
+    return abs(actual - stated) <= tol
+
+
+def _first_operand(expr: str):
+    """The first operand on an equation's left-hand side -- used to check that a
+    later step in a chain actually starts from the previous step's result,
+    rather than being an unrelated but individually-correct equation."""
+    match = _TERM_RE.search(expr)
+    if not match:
+        return None
+    try:
+        return _to_float(match.group(2))
+    except ValueError:
+        return None
+
+
+def _chained_correctness(equations: list[tuple[str, float]], tol: float = 0.01) -> list[bool]:
+    """Per-equation correctness, but every equation after the first must also
+    open with the previous equation's stated result (a + b = c, then c + ... --
+    not a + b = c, then d + e = f) to count as correct, so a run of unrelated
+    but individually-true equations can't pass as a running-total chain."""
+    results = []
+    prev_rhs = None
+    for expr, rhs in equations:
+        holds = _equation_holds(expr, rhs)
+        if prev_rhs is not None:
+            first = _first_operand(expr)
+            holds = holds and first is not None and abs(first - prev_rhs) <= tol
+        results.append(holds)
+        prev_rhs = rhs
+    return results
 
 
 def answer_accuracy(prompts, completions, solution, **kwargs) -> list[float]:
@@ -124,7 +197,7 @@ def format_coherence(prompts, completions, **kwargs) -> list[float]:
     return rewards
 
 
-def stepwise_arithmetic(prompts, completions, reference_raw_data, **kwargs) -> list[float]:
+def stepwise_reasoning(prompts, completions, reference_raw_data, **kwargs) -> list[float]:
     """Rewards showing an explicit running-total chain (a + b = c, c + d = e, ...)
     for multi-item sums, with each shown step arithmetically correct -- verified
     against the completion's own numbers, not the reference (so it still fires
@@ -134,7 +207,10 @@ def stepwise_arithmetic(prompts, completions, reference_raw_data, **kwargs) -> l
     Rewards two things, averaged:
     - coverage: showing roughly as many chained steps as there are terms to sum
       (estimated from how many decimal amounts appear in reference_raw_data)
-    - accuracy: each shown step's arithmetic actually being correct
+    - accuracy: each shown step's arithmetic actually being correct, AND (for
+      every step after the first) actually opening with the previous step's
+      result - so a run of unrelated but individually-true equations doesn't
+      score the same as a real running total.
     """
     rewards = []
     for completion, ref_raw in zip(completions, reference_raw_data):
@@ -155,20 +231,20 @@ def stepwise_arithmetic(prompts, completions, reference_raw_data, **kwargs) -> l
             rewards.append(0.0)
             continue
 
-        correct = sum(1 for a, op, b, c in equations if _equation_holds(a, op, b, c))
+        correct = sum(_chained_correctness(equations))
         accuracy = correct / len(equations)
         coverage = min(1.0, len(equations) / expected_steps)
         rewards.append((accuracy + coverage) / 2)
     return rewards
 
 
-REWARD_FUNCS = [answer_accuracy, grounding_quality, format_coherence, stepwise_arithmetic]
+REWARD_FUNCS = [answer_accuracy, grounding_quality, format_coherence, stepwise_reasoning]
 
 DEFAULT_REWARD_WEIGHTS: dict[str, float] = {
     "answer_accuracy": 2.5,
     "grounding_quality": 1.0,
     "format_coherence": 0.25,
-    "stepwise_arithmetic": 0.75,
+    "stepwise_reasoning": 0.75,
 }
 
 
